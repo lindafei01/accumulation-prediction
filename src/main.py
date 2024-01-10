@@ -392,13 +392,13 @@ if __name__ == "__main__":
     # get_dataset_from_deepchem()
     
         # configure neptune
-    run = neptune.init_run(
-        project="feiyl/my-LNP",
-        api_token="eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiI0YTkzM2EzYS1mZTIwLTQ4ZjAtYTc0NS01YjZlMzk2ZDQ2ODQifQ=="
-    )
-    run["configs"] = config
-    config["exp_name"] = run["sys/name"] = "_".join(tags)
-    run["sys/tags"].add(tags)
+    # run = neptune.init_run(
+    #     project="feiyl/my-LNP",
+    #     api_token="eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiI0YTkzM2EzYS1mZTIwLTQ4ZjAtYTc0NS01YjZlMzk2ZDQ2ODQifQ=="
+    # )
+    # run["configs"] = config
+    # config["exp_name"] = run["sys/name"] = "_".join(tags)
+    # run["sys/tags"].add(tags)
     
     calculate_3D_structure()
     construct_data_list(args.splitting)
