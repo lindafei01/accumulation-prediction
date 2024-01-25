@@ -5,10 +5,16 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Current File",
+            "name": "Python: main.py",
             "type": "python",
             "request": "launch",
-            "program": "${file}",
+            "program": "src/main.py",
+            "args":[
+                "--splitting", "random",
+                "--raw_data_path", "data/raw/labeled-20240102_merged_descriptors_normalized_descriptors_mean0_std1.csv",
+                "--label", "normalized_rlu_min_0_max_1",
+                "--gpu", "cuda:1"
+            ],
             "console": "integratedTerminal",
             "justMyCode": true
         }

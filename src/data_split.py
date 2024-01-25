@@ -59,7 +59,11 @@ def scaffold_split(data:pd.DataFrame, valid_size, test_size):
                 valid_inds += scaffold_set
         else:
             train_inds += scaffold_set
-
+            
+    if "scaffold_dataset_type" in data.columns:
+        data = data.drop("scaffold_dataset_type", axis=1)
+    data.insert(loc=0, column="scaffold_dataset_type", value=None)
+    
     for train_ind in train_inds:
         data.loc[train_ind, 'scaffold_dataset_type'] = 'train'
     for valid_ind in valid_inds:
@@ -69,12 +73,17 @@ def scaffold_split(data:pd.DataFrame, valid_size, test_size):
         
     return data
 
-def random_split(data, valid_size, test_size, random_seed=None):
+def random_split(data:pd.DataFrame, valid_size, test_size, random_seed=None):
     inds = list(range(data.shape[0]))
     train_size = 1 - valid_size - test_size
     train_inds, remaining_inds = train_test_split(inds, test_size=(1 - train_size), random_state=random_seed)
     test_ratio = test_size / (valid_size + test_size)
     valid_inds, test_inds = train_test_split(remaining_inds, test_size=test_ratio, random_state=random_seed)
+    
+    if "random_dataset_type" in data.columns:
+        data = data.drop("random_dataset_type", axis=1)    
+    data.insert(loc=0, column="random_dataset_type", value=None)
+    
     for train_ind in train_inds:
         data.loc[train_ind, 'random_dataset_type'] = 'train'
     for valid_ind in valid_inds:
@@ -87,7 +96,7 @@ def random_split(data, valid_size, test_size, random_seed=None):
 
 
 if __name__ == "__main__":
-    data_path = "data/raw/data_df.csv"
+    data_path = "data/raw/labeled-20240102_merged_descriptors_normalized_descriptors_mean0_std1.csv"
     valid_size = 0.15
     test_size = 0.15
     random_seed = 42

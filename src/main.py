@@ -14,6 +14,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch import optim
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from scipy.stats import pearsonr
 import argparse
 
 from unicore.modules import init_bert_params
@@ -29,8 +30,29 @@ from unimol.data import (
 )
 from unimol.models.transformer_encoder_with_pair import TransformerEncoderWithPair
 from unimol.models.unimol import NonLinearHead, GaussianLayer
+from sklearn.model_selection import KFold
 
 import neptune
+
+def get_top_recall(label_true, label_predict, top_percentage=0.16):
+
+    # 对实际值进行排序
+    sorted_indices_true = np.argsort(label_true) #升序排列
+    num_samples = len(label_true)
+    top_percent_true = sorted_indices_true[-int(num_samples * top_percentage):]
+
+    # 对预测值进行排序
+    sorted_indices_pred = np.argsort(label_predict)
+    top_percent_pred = sorted_indices_pred[-int(num_samples * top_percentage):]
+
+    # 计算在实际值和预测值中都位于前列的样本数量
+    intersection = np.intersect1d(top_percent_true, top_percent_pred)
+    num_intersection = len(intersection)
+
+    # 计算比例
+    top_recall = num_intersection / len(top_percent_true)
+    
+    return top_recall
 
 def set_random_seed(random_seed=1024):
     random.seed(random_seed)
@@ -129,9 +151,9 @@ class UniMolModel(nn.Module):
 #     )
 #     data_df.to_csv("../data/raw/data_df.csv", index=False)
 
-def calculate_3D_structure():
+def calculate_3D_structure(raw_data_path):
     def get_smiles_list_():
-        data_df = pd.read_csv("data/raw/data_df.csv")
+        data_df = pd.read_csv(raw_data_path)
         smiles_list = data_df["smiles"].tolist()
         smiles_list = list(set(smiles_list))
         print(len(smiles_list))
@@ -161,7 +183,7 @@ def calculate_3D_structure():
             if result != 0:
                 print('EmbedMolecule failed', result, smiles)
                 mutex.acquire()
-                with open('data/result/invalid_smiles.txt', 'a') as f:
+                with open(f'data/result/{os.path.basename(raw_data_path).split(".")[0]}_invalid_smiles.txt', 'a') as f:
                     f.write('EmbedMolecule failed' + ' ' + str(result) + ' ' + str(smiles) + '\n')
                 mutex.release()
                 continue
@@ -170,7 +192,7 @@ def calculate_3D_structure():
             except:
                 print('MMFFOptimizeMolecule error', smiles)
                 mutex.acquire()
-                with open('data/result/invalid_smiles.txt', 'a') as f:
+                with open(f'data/result/{os.path.basename(raw_data_path).split(".")[0]}_invalid_smiles.txt', 'a') as f:
                     f.write('MMFFOptimizeMolecule error' + ' ' + str(smiles) + '\n')
                 mutex.release()
                 continue
@@ -198,12 +220,12 @@ def calculate_3D_structure():
         t.start()
     for t in threads:
         t.join()
-    pkl.dump(smiles_to_conformation_dict, open('data/intermediate/smiles_to_conformation_dict.pkl', 'wb'))
+    pkl.dump(smiles_to_conformation_dict, open(f'data/intermediate/{os.path.basename(raw_data_path).split(".")[0]}_smiles_to_conformation_dict.pkl', 'wb'))
     print('Valid smiles count:', len(smiles_to_conformation_dict))
 
-def construct_data_list(splitting):
-    data_df = pd.read_csv("data/raw/data_df.csv")
-    smiles_to_conformation_dict = pkl.load(open('data/intermediate/smiles_to_conformation_dict.pkl', 'rb'))
+def construct_data_list(splitting:str, raw_data_path:str, label:str):
+    data_df = pd.read_csv(raw_data_path)
+    smiles_to_conformation_dict = pkl.load(open(f'data/intermediate/{os.path.basename(raw_data_path).split(".")[0]}_smiles_to_conformation_dict.pkl', 'rb'))
     data_list = []
     for index, row in data_df.iterrows():
         smiles = row["smiles"]
@@ -213,7 +235,7 @@ def construct_data_list(splitting):
                     "atoms": smiles_to_conformation_dict[smiles]["atoms"],
                     "coordinates": smiles_to_conformation_dict[smiles]["coordinates"],
                     "smiles": smiles,
-                    "label": row["label"],
+                    "label": row[label],
                     "dataset_type": row["scaffold_dataset_type"],
                 }
             elif splitting == "random":
@@ -221,13 +243,13 @@ def construct_data_list(splitting):
                     "atoms": smiles_to_conformation_dict[smiles]["atoms"],
                     "coordinates": smiles_to_conformation_dict[smiles]["coordinates"],
                     "smiles": smiles,
-                    "label": row["label"],
+                    "label": row[label],
                     "dataset_type": row["random_dataset_type"],
                 }                
             data_list.append(data_item)
-    pkl.dump(data_list, open(f'data/intermediate/{splitting}_data_list.pkl', 'wb'))
+    pkl.dump(data_list, open(f'data/intermediate/{os.path.basename(raw_data_path).split(".")[0]}_{splitting}_data_list.pkl', 'wb'))
 
-def convert_data_list_to_data_loader(remove_hydrogen, splitting):
+def convert_data_list_to_data_loader(remove_hydrogen, raw_data_path, splitting, num_folds=0):
     def convert_data_list_to_dataset_(data_list):
         dictionary = Dictionary.load('data/raw/token_list.txt')
         dictionary.add_symbol("[MASK]", is_special=True)
@@ -260,7 +282,31 @@ def convert_data_list_to_data_loader(remove_hydrogen, splitting):
         })
 
     batch_size = 64
-    data_list = pkl.load(open(f'data/intermediate/{splitting}_data_list.pkl', 'rb'))
+    data_list = pkl.load(open(f'data/intermediate/{os.path.basename(raw_data_path).split(".")[0]}_{splitting}_data_list.pkl', 'rb'))
+    
+    if num_folds != 0 : # cross_validation
+        
+        kf = KFold(n_splits=num_folds, shuffle=True)
+        fold_indices = kf.split(data_list)
+        data_loaders = []
+        
+        for fold, (train_indices, valid_indices) in enumerate(fold_indices):
+        
+            train_data = [data_list[i] for i in train_indices]
+            valid_data = [data_list[i] for i in valid_indices]
+
+
+            dataset_train = convert_data_list_to_dataset_(train_data)
+            dataset_valid = convert_data_list_to_dataset_(valid_data)
+
+            data_loader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, collate_fn=dataset_train.collater)
+            data_loader_valid = DataLoader(dataset_valid, batch_size=batch_size, shuffle=True, collate_fn=dataset_valid.collater)
+            
+            data_loaders.append((data_loader_train, data_loader_valid))
+        
+        return data_loaders
+    
+    
     data_list_train = [data_item for data_item in data_list if data_item["dataset_type"] == "train"]
     data_list_validate = [data_item for data_item in data_list if data_item["dataset_type"] == "validate"]
     data_list_test = [data_item for data_item in data_list if data_item["dataset_type"] == "test"] 
@@ -270,10 +316,14 @@ def convert_data_list_to_data_loader(remove_hydrogen, splitting):
     data_loader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, collate_fn=dataset_train.collater)
     data_loader_valid = DataLoader(dataset_validate, batch_size=batch_size, shuffle=True, collate_fn=dataset_validate.collater)
     data_loader_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=True, collate_fn=dataset_test.collater)
+    
+    
     return data_loader_train, data_loader_valid, data_loader_test
 
+
+
 class UniMolRegressor(nn.Module):
-    def __init__(self, remove_hydrogen):
+    def __init__(self, device, remove_hydrogen):
         super().__init__()
         self.encoder = UniMolModel()
         if remove_hydrogen:
@@ -287,10 +337,11 @@ class UniMolRegressor(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 1),
         )
+        self.device = device
 
     def move_batch_to_cuda(self, batch):
-        batch['input'] = { k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch['input'].items() }
-        batch['target'] = { k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch['target'].items() }
+        batch['input'] = { k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch['input'].items() }
+        batch['target'] = { k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch['target'].items() }
         return batch
 
     def forward(self, batch):
@@ -301,10 +352,40 @@ class UniMolRegressor(nn.Module):
         x = self.mlp(molecule_representation)
         return x
 
-def evaluate(model, data_loader):
+class UniMolClassifier(nn.Module):
+    def __init__(self, device, remove_hydrogen):
+        raise NotImplementedError
+ 
+    
+def evaluate_regression(model, device, data_loader):
     model.eval()
-    label_predict = torch.tensor([], dtype=torch.float32).cuda()
-    label_true = torch.tensor([], dtype=torch.float32).cuda()
+    label_predict = torch.tensor([], dtype=torch.float32).to(device)
+    label_true = torch.tensor([], dtype=torch.float32).to(device)
+    with torch.no_grad():
+        for batch in tqdm(data_loader):
+            label_predict_batch = model(batch)
+            label_true_batch = batch['target']['label']
+
+            label_predict = torch.cat((label_predict, label_predict_batch.detach()), dim=0)
+            label_true = torch.cat((label_true, label_true_batch.detach()), dim=0)
+    
+    label_predict = label_predict.cpu().numpy()
+    label_true = label_true.cpu().numpy()
+    rmse = round(np.sqrt(mean_squared_error(label_true, label_predict)), 3)
+    mae = round(mean_absolute_error(label_true, label_predict), 3)
+    r2 = round(r2_score(label_true, label_predict), 3)
+    corr = round(pearsonr(label_true, label_predict.squeeze())[0], 3)
+    if abs(corr) > 1:
+        print('')
+    top_recall = round(get_top_recall(label_true, label_predict.squeeze()), 3)
+    metric = {"rmse": rmse, 'mae': mae, 'r2': r2, "corr": corr, "top_recall": top_recall}
+    return metric
+
+def evaluate_classification(model, device, data_loader):
+    raise NotImplementedError
+    model.eval()
+    label_predict = torch.tensor([], dtype=torch.float32).to(device)
+    label_true = torch.tensor([], dtype=torch.float32).to(device)
     with torch.no_grad():
         # for batch in data_loader:
         for batch in tqdm(data_loader):
@@ -319,14 +400,18 @@ def evaluate(model, data_loader):
     rmse = round(np.sqrt(mean_squared_error(label_true, label_predict)), 3)
     mae = round(mean_absolute_error(label_true, label_predict), 3)
     r2 = round(r2_score(label_true, label_predict), 3)
-    metric = {'rmse': rmse, 'mae': mae, 'r2': r2}
+    corr = round(pearsonr(label_true, label_predict.squeeze())[0], 3)
+    if abs(corr) > 1:
+        print('')
+    top_recall = round(get_top_recall(label_true, label_predict.squeeze()), 3)
+    metric = {"rmse": rmse, 'mae': mae, 'r2': r2, "corr": corr, "top_recall": top_recall}
     return metric
 
-def train(model_version, remove_hydrogen=True, splitting="scaffold"):
-    data_loader_train, data_loader_validate, data_loader_test = convert_data_list_to_data_loader(remove_hydrogen, splitting)
+def train_regression(model_version, raw_data_path, device, remove_hydrogen=True, splitting="scaffold"):
+    data_loader_train, data_loader_validate, data_loader_test = convert_data_list_to_data_loader(remove_hydrogen, raw_data_path, splitting)
 
-    model = UniMolRegressor(remove_hydrogen)
-    model.cuda()
+    model = UniMolRegressor(device, remove_hydrogen)
+    model.to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=5e-5, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, 15)
@@ -351,9 +436,9 @@ def train(model_version, remove_hydrogen=True, splitting="scaffold"):
             optimizer.step()
         scheduler.step()
         
-        metric_train = evaluate(model, data_loader_train)
-        metric_validate = evaluate(model, data_loader_validate)
-        metric_test = evaluate(model, data_loader_test)
+        metric_train = evaluate_regression(model, device=device, data_loader=data_loader_train)
+        metric_validate = evaluate_regression(model, device=device, data_loader=data_loader_validate)
+        metric_test = evaluate_regression(model, device=device, data_loader=data_loader_test)
 
         if metric_validate['rmse'] < current_best_metric:
             current_best_metric = metric_validate['rmse']
@@ -367,28 +452,96 @@ def train(model_version, remove_hydrogen=True, splitting="scaffold"):
         print('Test', metric_test)
         print('current_best_epoch', current_best_epoch, 'current_best_metric', current_best_metric)
         print("==================================================================================")
-        if epoch > current_best_epoch + max_bearable_epoch:
-            break
+        # if epoch > current_best_epoch + max_bearable_epoch:
+        #     break
 
-def test(model_version, remove_hydrogen=True, splitting="scaffold"):
-    data_loader_train, data_loader_validate, data_loader_test = convert_data_list_to_data_loader(remove_hydrogen, splitting)
+def test_regression(model_version, raw_data_path, device, remove_hydrogen=True,  splitting="scaffold"):
+    data_loader_train, data_loader_validate, data_loader_test = convert_data_list_to_data_loader(remove_hydrogen, raw_data_path, splitting)
 
-    model = UniMolRegressor(remove_hydrogen)
+    model = UniMolRegressor(device, remove_hydrogen)
     model.load_state_dict(torch.load("weight/" + model_version + ".pt"))
-    model.cuda()
+    model.to(device)
 
-    metric_train = evaluate(model, data_loader_train)
-    metric_validate = evaluate(model, data_loader_validate)
-    metric_test = evaluate(model, data_loader_test)
+    metric_train = evaluate_regression(model, device=device, data_loader=data_loader_train)
+    metric_validate = evaluate_regression(model, device=device, data_loader=data_loader_validate)
+    metric_test = evaluate_regression(model, device=device, data_loader=data_loader_test)
+    print("Train", metric_train)
+    print("validate", metric_validate)
+    print("Test", metric_test)
+    
+def train_classification(model_version, raw_data_path, device, remove_hydrogen=True, splitting="scaffold"):
+    data_loader_train, data_loader_validate, data_loader_test = convert_data_list_to_data_loader(remove_hydrogen, raw_data_path, splitting)
+
+    model = UniMolRegressor(device, remove_hydrogen)
+    model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=5e-5, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, 15)
+
+    current_best_metric = 1e10
+    max_bearable_epoch = 50
+    current_best_epoch = 0
+    for epoch in range(300):
+        model.train()
+        # for batch in data_loader_train:
+        for batch in tqdm(data_loader_train):
+            label_predict_batch = model(batch)
+            label_true_batch = batch['target']['label'].unsqueeze(1).to(torch.float32)
+
+            
+            loss = criterion(label_predict_batch, label_true_batch)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+        
+        metric_train = evaluate_classification(model, device=device, data_loader=data_loader_train)
+        metric_validate = evaluate_classification(model, device=device, data_loader=data_loader_validate)
+        metric_test = evaluate_classification(model, device=device, data_loader=data_loader_test)
+
+        if metric_validate['rmse'] < current_best_metric:
+            current_best_metric = metric_validate['rmse']
+            current_best_epoch = epoch
+            torch.save(model.state_dict(), "weight/" + model_version + ".pt")
+
+        print("==================================================================================")
+        print('Epoch', epoch)
+        print('Train', metric_train)
+        print('validate', metric_validate)
+        print('Test', metric_test)
+        print('current_best_epoch', current_best_epoch, 'current_best_metric', current_best_metric)
+        print("==================================================================================")
+        
+def test_classification(model_version, raw_data_path, device, remove_hydrogen=True,  splitting="scaffold"):
+    data_loader_train, data_loader_validate, data_loader_test = convert_data_list_to_data_loader(remove_hydrogen, raw_data_path, splitting)
+
+    model = UniMolRegressor(device, remove_hydrogen)
+    model.load_state_dict(torch.load("weight/" + model_version + ".pt"))
+    model.to(device)
+
+    metric_train = evaluate_classification(model, device=device, data_loader=data_loader_train)
+    metric_validate = evaluate_classification(model, device=device, data_loader=data_loader_validate)
+    metric_test = evaluate_classification(model, device=device, data_loader=data_loader_test)
     print("Train", metric_train)
     print("validate", metric_validate)
     print("Test", metric_test)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--task", default="regression", type=str, choices=["regression", "classification"])
     parser.add_argument("--splitting", default="scaffold", type=str, help="Path to the config file.")
+    parser.add_argument("--raw_data_path", default="data/raw/labeled-20240102_merged_descriptors_normalized_descriptors_mean0_std1.csv", type=str, help="raw_data_path")
+    parser.add_argument("--label", default="normalized_rlu_min_0_max_1", type=str, help="label")
+    parser.add_argument("--gpu", default="cuda:2", type=str)
     args = parser.parse_args()
     set_random_seed(1024)
+    if torch.cuda.is_available() and args.gpu != "cpu":
+        args.device = args.gpu
+        torch.cuda.set_device(args.device)
+    else:
+        args.device = "cpu"
+
+    model_version = os.path.basename(args.raw_data_path).split(".")[0] + "_" + args.splitting + "_" + args.label 
     # get_dataset_from_deepchem()
     
         # configure neptune
@@ -400,8 +553,8 @@ if __name__ == "__main__":
     # config["exp_name"] = run["sys/name"] = "_".join(tags)
     # run["sys/tags"].add(tags)
     
-    calculate_3D_structure()
-    construct_data_list(args.splitting)
-    train(model_version='0', remove_hydrogen=True, splitting=args.splitting)
-    test(model_version='0', remove_hydrogen=True, splitting=args.splitting)
+    calculate_3D_structure(raw_data_path=args.raw_data_path)
+    construct_data_list(splitting=args.splitting, raw_data_path=args.raw_data_path, label=args.label)
+    train(model_version=model_version, remove_hydrogen=True, raw_data_path=args.raw_data_path, splitting=args.splitting, device=args.device)
+    test(model_version=model_version, remove_hydrogen=True, raw_data_path=args.raw_data_path, splitting=args.splitting, device=args.device)
     print('All is well!')

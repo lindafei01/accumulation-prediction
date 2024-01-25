@@ -1,0 +1,9 @@
+Best Parameter Combination's Scores:
+Accuracy - Mean: 0.7990, Std: 0.0416
+Precision - Mean: 0.7533, Std: 0.0519
+Recall - Mean: 0.7579, Std: 0.0811
+F1 - Mean: 0.7542, Std: 0.0591
+Tp - Mean: 15.0000, Std: 2.4495
+Fp - Mean: 4.8000, Std: 0.7483
+Tn - Mean: 23.2000, Std: 2.7129
+Fn - Mean: 4.8000, Std: 1.7205
