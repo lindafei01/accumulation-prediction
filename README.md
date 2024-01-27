@@ -7,7 +7,7 @@
 
 ### model weight
 
-You can download the weight directory from https://drive.google.com/drive/folders/1UXdCyXML41Pp37y0Q61FObl8Hy51RWYn?usp=drive_link.
+You can download the weight directory from https://drive.google.com/drive/folders/1xgoOgl7KIu_6fxy_vCYw7ZP11W75ZXiK.
 
 ### how to install Uni-Mol
 
