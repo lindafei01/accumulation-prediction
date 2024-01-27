@@ -1,0 +1,1 @@
+MolFromSmiles error Clc1cccc(C(c2cc([C@@](c3c[nH]cn3C)(c4ccc(Cl)cc4)[NH3+])ccc2N5C)=CC5=O)c1

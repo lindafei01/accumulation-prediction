@@ -1,3 +1,2 @@
 weight/
-./
-data/
+*.whl
