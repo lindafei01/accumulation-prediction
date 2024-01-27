@@ -7,7 +7,7 @@ shape of molecules.
 ###############################################################################
 import numpy as np
 import pybel
-import openbabel
+# import openbabel
 import optparse
 import json
 import sys
@@ -34,10 +34,16 @@ def main():
     confs = list(pybel.readfile("sdf", options.sdf_file))
     globs = np.empty(len(confs))
     pbfs = np.empty(len(confs))
+    predictions = [None for _ in range(len(confs))]
     for i in range(len(confs)):
         # calculate properties
-        globs[i] = calc_glob(confs[i])
-        pbfs[i] = calc_pbf(confs[i])
+        # globs[i] = calc_glob(confs[i])
+        # pbfs[i] = calc_pbf(confs[i])
+        predictions[i] = get_predicted_properties(confs[i]) 
+        
+    # process predictions 
+    # ...
+        
         
 
     data = {}

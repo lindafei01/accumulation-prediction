@@ -49,38 +49,8 @@ from imblearn.over_sampling import SMOTE, RandomOverSampler
 from imblearn.pipeline import Pipeline as IMBPipeline
 from sklearn.pipeline import Pipeline
 import statistics
-
-def tn(y_true, y_pred): return confusion_matrix(y_true, y_pred).ravel()[0]
-def fp(y_true, y_pred): return confusion_matrix(y_true, y_pred).ravel()[1]
-def fn(y_true, y_pred): return confusion_matrix(y_true, y_pred).ravel()[2]
-def tp(y_true, y_pred): return confusion_matrix(y_true, y_pred).ravel()[3]
-
-scoring = {'accuracy': 'accuracy', 'precision': 'precision', 
-           'recall': 'recall', 'f1': 'f1',
-           'tp': make_scorer(tp), 'fp': make_scorer(fp), 
-           'tn': make_scorer(tn), 'fn': make_scorer(fn)}
-
-def generate_upsampled_raw_data(raw_data_path, target_column, minority_label):
-    df = pd.read_csv(raw_data_path)
-    df_majority = df[df[target_column] == (1 - minority_label)]
-    df_minority = df[df[target_column] == minority_label]
-
-    majority_count = df_majority.shape[0]
-    minority_count = df_minority.shape[0]
-    
-    additional_samples_needed = majority_count - minority_count
-    df_minority_additional = resample(df_minority,
-                                      replace=True,      
-                                      n_samples=additional_samples_needed,    
-                                      random_state=123)  
-
-    df_minority_upsampled = pd.concat([df_minority, df_minority_additional])
-
-    df_upsampled = pd.concat([df_majority, df_minority_upsampled])
-
-    print(df_upsampled[target_column].value_counts())
-
-    df_upsampled.to_csv(f"data/raw/{os.path.basename(raw_data_path).split('.')[0]}_upsampled_{target_column}.csv", index=False)
+from training import train_svc, train_mlp, train_knn, train_LogisticRegression, train_RidgeClassifier, train_RandomForestClassifier, train_GradientBoostingClassifier
+from unimol_encoder import UniMolEncoder
 
 def set_random_seed(random_seed=1024):
     random.seed(random_seed)
@@ -92,69 +62,6 @@ def set_random_seed(random_seed=1024):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.enabled = False
-
-class UniMolModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        dictionary = Dictionary.load('data/raw/token_list.txt')
-        dictionary.add_symbol("[MASK]", is_special=True)
-        self.padding_idx = dictionary.pad()
-        self.embed_tokens = nn.Embedding(
-            len(dictionary), 512, self.padding_idx
-        )
-        self._num_updates = None
-        self.encoder = TransformerEncoderWithPair(
-            encoder_layers=15,
-            embed_dim=512,
-            ffn_embed_dim=2048,
-            attention_heads=64,
-            emb_dropout=0.1,
-            dropout=0.1,
-            attention_dropout=0.1,
-            activation_dropout=0.0,
-            max_seq_len=512,
-            activation_fn='gelu',
-            no_final_head_layer_norm=True,
-        )
-
-        K = 128
-        n_edge_type = len(dictionary) * len(dictionary)
-        self.gbf_proj = NonLinearHead(
-            K, 64, 'gelu'
-        )
-        self.gbf = GaussianLayer(K, n_edge_type)
-
-        self.apply(init_bert_params)
-
-    def forward(
-        self,
-        sample,
-    ):
-        input = sample['input']
-        src_tokens, src_distance, src_coord, src_edge_type \
-            = input['src_tokens'], input['src_distance'], input['src_coord'], input['src_edge_type']
-        padding_mask = src_tokens.eq(self.padding_idx)
-        if not padding_mask.any():
-            padding_mask = None
-        x = self.embed_tokens(src_tokens)
-
-        def get_dist_features(dist, et):
-            n_node = dist.size(-1)
-            gbf_feature = self.gbf(dist, et)
-            gbf_result = self.gbf_proj(gbf_feature)
-            graph_attn_bias = gbf_result
-            graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
-            graph_attn_bias = graph_attn_bias.view(-1, n_node, n_node)
-            return graph_attn_bias
-
-        graph_attn_bias = get_dist_features(src_distance, src_edge_type)
-        (encoder_rep, encoder_pair_rep, delta_encoder_pair_rep, x_norm, delta_encoder_pair_rep_norm) \
-            = self.encoder(x, padding_mask=padding_mask, attn_mask=graph_attn_bias)
-        output = {
-            "molecule_representation": encoder_rep[:, 0, :],  # get cls token
-            "smiles": sample['input']["smiles"],
-        }
-        return output
 
 def calculate_3D_structure(raw_data_path):
     def get_smiles_list_():
@@ -236,62 +143,7 @@ def calculate_3D_structure(raw_data_path):
     pkl.dump(smiles_to_conformation_dict, open(f'data/intermediate/{os.path.basename(raw_data_path).split(".")[0]}_smiles_to_conformation_dict.pkl', 'wb'))
     print('Valid smiles count:', len(smiles_to_conformation_dict))
 
-def construct_data_list(raw_data_path:str, label:str):
-    data_df = pd.read_csv(raw_data_path)
-    smiles_to_conformation_dict = pkl.load(open(f'data/intermediate/SMILES_accum_S2_smiles_to_conformation_dict.pkl', 'rb'))
-    data_list = []
-    for index, row in data_df.iterrows():
-        smiles = row["SMILES"]
-        if smiles in smiles_to_conformation_dict:
-            data_item = {
-                "atoms": smiles_to_conformation_dict[smiles]["atoms"],
-                "coordinates": smiles_to_conformation_dict[smiles]["coordinates"],
-                "smiles": smiles,
-                "label": row[label],
-            }    
-            data_list.append(data_item)
-    pkl.dump(data_list, open(f'data/intermediate/{os.path.basename(raw_data_path).split(".")[0]}_{label}_data_list.pkl', 'wb'))
-    
-def convert_whole_data_list_to_data_loader(remove_hydrogen, raw_data_path):
-    def convert_data_list_to_dataset_(data_list):
-        dictionary = Dictionary.load('data/raw/token_list.txt')
-        dictionary.add_symbol("[MASK]", is_special=True)
-        smiles_dataset = KeyDataset(data_list, "smiles")
-        label_dataset = KeyDataset(data_list, "label")
-        dataset = ConformerSampleDataset(data_list, 1024, "atoms", "coordinates")
-        dataset = AtomTypeDataset(data_list, dataset)
-        dataset = RemoveHydrogenDataset(dataset, "atoms", "coordinates", remove_hydrogen, False)
-        dataset = CroppingDataset(dataset, 1, "atoms", "coordinates", 256)
-        dataset = NormalizeDataset(dataset, "coordinates", normalize_coord=True)
-        token_dataset = KeyDataset(dataset, "atoms")
-        token_dataset = TokenizeDataset(token_dataset, dictionary, max_seq_len=512)
-        coord_dataset = KeyDataset(dataset, "coordinates")
-        src_dataset = AppendTokenDataset(PrependTokenDataset(token_dataset, dictionary.bos()), dictionary.eos())
-        edge_type = EdgeTypeDataset(src_dataset, len(dictionary))
-        coord_dataset = FromNumpyDataset(coord_dataset)
-        coord_dataset = AppendTokenDataset(PrependTokenDataset(coord_dataset, 0.0), 0.0)
-        distance_dataset = DistanceDataset(coord_dataset)
-        return NestedDictionaryDataset({
-            "input": {
-                "src_tokens": RightPadDataset(src_dataset, pad_idx=dictionary.pad(),),
-                "src_coord": RightPadDatasetCoord(coord_dataset, pad_idx=0,),
-                "src_distance": RightPadDataset2D(distance_dataset, pad_idx=0,),
-                "src_edge_type": RightPadDataset2D(edge_type, pad_idx=0,),
-                "smiles": RawArrayDataset(smiles_dataset),
-            }, 
-            "target": {
-                "label": RawLabelDataset(label_dataset),
-            }
-        })
-        
-    batch_size = 1
-    data_list = pkl.load(open(f'data/intermediate/{os.path.basename(raw_data_path).split(".")[0]}_Formal charge Class_data_list.pkl', 'rb'))
-    
-    data = [data_list[i] for i in range(len(data_list))]
-    dataset = convert_data_list_to_dataset_(data)
-    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=dataset.collater)
-    
-    return data_loader
+
 
 def convert_smiles_list_to_data_loader(remove_hydrogen, smiles_list:list):
             
@@ -408,563 +260,7 @@ def convert_smiles_list_to_data_loader(remove_hydrogen, smiles_list:list):
     
     return data_loader
 
-class UniMolRegressor(nn.Module):
-    def __init__(self, device, remove_hydrogen):
-        super().__init__()
-        self.encoder = UniMolModel()
-        if remove_hydrogen:
-            self.encoder.load_state_dict(torch.load('weight/mol_pre_no_h_220816.pt')['model'], strict=False)
-        else:
-            self.encoder.load_state_dict(torch.load('weight/mol_pre_all_h_220816.pt')['model'], strict=False)
-        self.mlp = nn.Sequential(
-            nn.Linear(512, 128),
-            nn.ReLU(),
-            nn.Linear(128, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-        )
-        self.device = device
 
-    def move_batch_to_cuda(self, batch):
-        batch['input'] = { k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch['input'].items() }
-        batch['target'] = { k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch['target'].items() }
-        return batch
-
-    def forward(self, batch):
-        batch = self.move_batch_to_cuda(batch)
-        encoder_output = self.encoder(batch)
-        molecule_representation = encoder_output['molecule_representation']
-        smiles_list = encoder_output['smiles']
-        x = self.mlp(molecule_representation)
-        return x
-
-class UniMolEncoder(nn.Module):
-    def __init__(self, device, remove_hydrogen):
-        super().__init__()
-        self.encoder = UniMolModel()
-        if remove_hydrogen:
-            self.encoder.load_state_dict(torch.load('weight/mol_pre_no_h_220816.pt')['model'], strict=False)
-        else:
-            self.encoder.load_state_dict(torch.load('weight/mol_pre_all_h_220816.pt')['model'], strict=False)
-
-        self.device = device
-
-    def move_batch_to_cuda(self, batch):
-        try:
-            batch['input'] = { k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch['input'].items() }
-            batch['target'] = { k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch['target'].items() }
-        except:
-            batch['input'] = { k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch['input'].items() }
-        return batch
-
-    def forward(self, batch):
-        batch = self.move_batch_to_cuda(batch)
-        encoder_output = self.encoder(batch)
-        molecule_representation = encoder_output['molecule_representation']
-        smiles_list = encoder_output['smiles']
-        
-        return smiles_list, molecule_representation
-    
-def evaluate(model, device, data_loader):
-    model.eval()
-    label_predict = torch.tensor([], dtype=torch.float32).to(device)
-    label_true = torch.tensor([], dtype=torch.float32).to(device)
-    with torch.no_grad():
-        for batch in tqdm(data_loader):
-            label_predict_batch = model(batch)
-            label_true_batch = batch['target']['label']
-
-            label_predict = torch.cat((label_predict, label_predict_batch.detach()), dim=0)
-            label_true = torch.cat((label_true, label_true_batch.detach()), dim=0)
-    
-    label_predict = label_predict.cpu().numpy()
-    label_true = label_true.cpu().numpy()
-    rmse = round(np.sqrt(mean_squared_error(label_true, label_predict)), 3)
-    mae = round(mean_absolute_error(label_true, label_predict), 3)
-    r2 = round(r2_score(label_true, label_predict), 3)
-    corr = round(pearsonr(label_true, label_predict.squeeze())[0], 3)
-    if abs(corr) > 1:
-        print('')
-    metric = {"rmse": rmse, 'mae': mae, 'r2': r2, "corr": corr}
-    return metric
-
-def get_UniMol_data_loader(raw_data_path, label, remove_hydrogen):
-    with open(f"data/intermediate/{os.path.basename(raw_data_path).split('.')[0]}_{label}_data_list.pkl", "rb") as f:
-        data_list = pkl.load(f)
-    
-    if f"upsampled_{label}" in raw_data_path:
-        if remove_hydrogen:
-            with open(f"data/embedding/{os.path.basename(raw_data_path).split('.')[0].replace(f'_upsampled_{label}','')}_embedding_no_h.pkl", "rb") as f:
-                embedding = pkl.load(f)
-        else:
-            with open(f"data/embedding/{os.path.basename(raw_data_path).split('.')[0].replace(f'_upsampled_{label}','')}_embedding_all_h.pkl", "rb") as f:
-                embedding = pkl.load(f)
-    else:
-        if remove_hydrogen:
-            with open(f"data/embedding/{os.path.basename(raw_data_path).split('.')[0]}_embedding_no_h.pkl", "rb") as f:
-                embedding = pkl.load(f)
-        else:
-            with open(f"data/embedding/{os.path.basename(raw_data_path).split('.')[0]}_embedding_all_h.pkl", "rb") as f:
-                embedding = pkl.load(f)       
-              
-    X = []
-    y = []
-    # smiles_list = []
-    
-    # assert len(embedding) == len(data_list)
-    for i in range(len(data_list)):
-        # smiles_list.append(data_list[i]["smiles"])
-        y.append(data_list[i]["label"])
-        X.append(embedding[data_list[i]["smiles"]].cpu().detach().numpy())    
-    
-    # return smiles_list, np.array(X), np.array(y)
-    return np.array(X), np.array(y)
-
-def get_MolCLR_data_loader(raw_data_path, label, model):
-    
-    assert model in ["gin", "gcn"]
-    with open(f"data/intermediate/{os.path.basename(raw_data_path).split('.')[0]}_{label}_data_list.pkl", "rb") as f:
-        data_list = pkl.load(f)
-    
-    if f"upsampled_{label}" in raw_data_path:     
-        with open(f"data/embedding/{os.path.basename(raw_data_path).split('.')[0].replace(f'_upsampled_{label}','')}_embedding_{model}.pkl", "rb") as f:
-            embedding = pkl.load(f)
-    else:     
-        with open(f"data/embedding/{os.path.basename(raw_data_path).split('.')[0].replace(f'_upsampled_{label}','')}_embedding_{model}.pkl", "rb") as f:
-            embedding = pkl.load(f)
-    
-    X = []
-    y = []
-    # smiles_list = []
-    
-    for i in range(len(data_list)):
-        try:
-            X.append(embedding[data_list[i]["smiles"]].cpu().detach().numpy())    
-            # smiles_list.append(data_list[i]["smiles"])
-            y.append(data_list[i]["label"])
-        except:
-            print(f"no MolCLR embedding {data_list[i]['smiles']}")
-    
-    # return smiles_list, np.array(X), np.array(y)
-    return np.array(X), np.array(y)
-
-def train_svc(model_version, raw_data_path, label, args):
-    
-    if args.embedding == "unimol_no_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=True)
-    elif args.embedding == "unimol_all_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=False)
-    elif args.embedding == "gin":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gin")
-    elif args.embedding == "gcn":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gcn")
-    else:
-        raise NotImplemented
-    
-
-    # scaler = StandardScaler()
-    # X_scaled = scaler.fit_transform(X)
-
-    # pca = PCA(n_components=128)
-    # X = pca.fit_transform(X_scaled)
-
-    kfold = KFold(n_splits=5, shuffle=True, random_state=42)
-    
-    # param_grid = {
-    #     'C': [0.1, 1, 10, 100],  # Regularization parameter. The strength of the regularization is inversely proportional to C. Must be strictly positive.
-    #     'kernel': ['linear', 'poly', 'rbf', 'sigmoid'],  # Specifies the kernel type to be used in the algorithm.
-    #     # 'degree': [2, 3, 4],  # Degree of the polynomial kernel function ('poly'). Ignored by all other kernels.
-    #     'gamma': ["scale", "auto"],  # Kernel coefficient for 'rbf', 'poly', and 'sigmoid'.
-    #     # 'coef0': [0.0, 0.1, 0.5],  # Independent term in kernel function. It is only significant in 'poly' and 'sigmoid'.
-    #     # 'shrinking': [True, False],  # Whether to use the shrinking heuristic.
-    #     # 'probability': [True, False],  # Whether to enable probability estimates.
-    #     # 'tol': [1e-3, 1e-4],  # Tolerance for stopping criterion.
-    #     # 'class_weight': [None, 'balanced'],  # Set the parameter C of class i to class_weight[i]*C for SVC. If not given, all classes are supposed to have weight one.
-    #     # 'decision_function_shape': ['ovo', 'ovr'],  # Whether to return a one-vs-rest ('ovr') decision function of shape (n_samples, n_classes) or the original one-vs-one ('ovo') decision function.
-    # }
-    
-    param_grid = {
-        'C': [0.1, 1, 10],  # Regularization parameter. The strength of the regularization is inversely proportional to C. Must be strictly positive.
-        'kernel': ['linear', 'rbf', 'poly'],  # Specifies the kernel type to be used in the algorithm.
-        'gamma': ["scale", "auto"],  # Kernel coefficient for 'rbf', 'poly', and 'sigmoid'.
-    }
-
-
-    svc = SVC()
-    grid_search = GridSearchCV(estimator=svc, param_grid=param_grid, scoring=scoring, refit="accuracy", cv=kfold)
-
-    grid_search.fit(X, y)   
-    cv_results = grid_search.cv_results_
-
-    best_index = grid_search.best_index_
-    with open(f"log/{model_version}_{args.embedding}_svc.log", "a") as file:
-        file.write("Best Parameter Combination's Scores:\n")
-        for scorer in scoring.keys():
-            mean_metric_key = f'mean_test_{scorer}'
-            std_metric_key = f'std_test_{scorer}'
-            
-            mean_score = cv_results[mean_metric_key][best_index]
-            std_score = cv_results[std_metric_key][best_index]
-            
-            file.write(f"{scorer.capitalize()} - Mean: {mean_score:.4f}, Std: {std_score:.4f}\n")
-    
-    svc_best_model = grid_search.best_estimator_
-    with open(f"weight/{model_version}_{args.embedding}_svc.pkl", "wb") as file:
-        pkl.dump(svc_best_model, file)
-
-def train_mlp(model_version, raw_data_path, label, args):  
-    if args.embedding == "unimol_no_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=True)
-    elif args.embedding == "unimol_all_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=False)
-    elif args.embedding == "gin":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gin")
-    elif args.embedding == "gcn":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gcn")
-    else:
-        raise NotImplemented
-    
-    kfold = KFold(n_splits=5, shuffle=True, random_state=42)
-    
-    param_grid = {
-        'mlpclassifier__hidden_layer_sizes': [(128, 32,), (64, 64,)],
-        'mlpclassifier__alpha': [0.0001, 0.001, 0.01],
-        'mlpclassifier__solver': ['adam'],
-        'mlpclassifier__learning_rate_init': [.005, .001]
-    }
-    
-    mlp = MLPClassifier(max_iter=10000, verbose=10, random_state=12)
-    
-    pipeline = Pipeline([
-        ('standardscaler', StandardScaler()),
-        ('mlpclassifier', mlp)
-    ])
-    
-    # pipeline = make_pipeline(StandardScaler(), mlp)
-    
-    grid_search = GridSearchCV(estimator=pipeline, param_grid=param_grid, scoring=scoring, refit="accuracy", cv=kfold, n_jobs=-1)
-    
-    grid_search.fit(X, y)
-    
-    cv_results = grid_search.cv_results_
-
-    best_index = grid_search.best_index_
-    with open(f"log/{model_version}_{args.embedding}_mlp.log", "a") as file:
-        file.write("Best Parameter Combination's Scores:\n")
-        for scorer in scoring.keys():
-            mean_metric_key = f'mean_test_{scorer}'
-            std_metric_key = f'std_test_{scorer}'
-            
-            mean_score = cv_results[mean_metric_key][best_index]
-            std_score = cv_results[std_metric_key][best_index]
-            
-            file.write(f"{scorer.capitalize()} - Mean: {mean_score:.4f}, Std: {std_score:.4f}\n")
-    
-    svc_best_model = grid_search.best_estimator_
-    with open(f"weight/{model_version}_{args.embedding}_mlp.pkl", "wb") as file:
-        pkl.dump(svc_best_model, file)
-
-def train_knn(model_version, raw_data_path, label, args):
-    
-    if args.embedding == "unimol_no_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=True)
-    elif args.embedding == "unimol_all_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=False)
-    elif args.embedding == "gin":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gin")
-    elif args.embedding == "gcn":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gcn")
-    else:
-        raise NotImplementedError
-    
-    knn = KNeighborsClassifier()
-    
-    if args.resample:
-        # smote = SMOTE(random_state=42)
-        ros = RandomOverSampler(random_state=42)
-        pipeline = IMBPipeline(steps=[('ros', ros), ('knn', knn)])
-    else:
-        # Create a pipeline with just KNN
-        pipeline = Pipeline(steps=[('knn', knn)])
-        
-    kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    param_grid = {
-    'n_neighbors': [1, 3, 5, 7, 9, 11, 13, 15],  
-    'weights': ['uniform', 'distance'],
-    'metric': ['euclidean', 'manhattan', 'minkowski']}
-    
-    param_grid = {f'knn__{key}': value for key, value in param_grid.items()}
-    
-    grid_search = GridSearchCV(pipeline, param_grid, cv=kfold, scoring=scoring, refit="accuracy", verbose=1)
-    grid_search.fit(X, y)
-    
-    cv_results = grid_search.cv_results_
-
-    best_index = grid_search.best_index_
-    if args.resample:
-        prefix = "resampled_"
-    else:
-        prefix = ""
-    with open(f"log/{prefix}{model_version}_{args.embedding}_knn.log", "a") as file:
-        file.write("Best Parameter Combination's Scores:\n")
-        for scorer in scoring.keys():
-            mean_metric_key = f'mean_test_{scorer}'
-            std_metric_key = f'std_test_{scorer}'
-            
-            mean_score = cv_results[mean_metric_key][best_index]
-            std_score = cv_results[std_metric_key][best_index]
-            
-            file.write(f"{scorer.capitalize()} - Mean: {mean_score:.4f}, Std: {std_score:.4f}\n")
-    
-    svc_best_model = grid_search.best_estimator_
-    with open(f"weight/{prefix}{model_version}_{args.embedding}_knn.pkl", "wb") as file:
-        pkl.dump(svc_best_model, file)
-
-def train_LogisticRegression(model_version, raw_data_path, label, args):
-    if args.embedding == "unimol_no_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=True)
-    elif args.embedding == "unimol_all_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=False)
-    elif args.embedding == "gin":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gin")
-    elif args.embedding == "gcn":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gcn")
-    else:
-        raise NotImplemented
-    
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-    param_grid = {'C': np.logspace(-4, 4, 20), 'solver': ['liblinear', 'saga'], 'penalty': ['l1', 'l2']}
-
-    logreg = LogisticRegression(max_iter=1000)
-    grid_search = GridSearchCV(estimator=logreg, param_grid=param_grid, scoring=scoring, refit="accuracy", cv=kfold)
-    grid_search.fit(X_scaled, y)
-
-    cv_results = grid_search.cv_results_
-
-    best_index = grid_search.best_index_
-    with open(f"log/{model_version}_{args.embedding}_LogisticRegression.log", "a") as file:
-        file.write("Best Parameter Combination's Scores:\n")
-        for scorer in scoring.keys():
-            mean_metric_key = f'mean_test_{scorer}'
-            std_metric_key = f'std_test_{scorer}'
-            
-            mean_score = cv_results[mean_metric_key][best_index]
-            std_score = cv_results[std_metric_key][best_index]
-            
-            file.write(f"{scorer.capitalize()} - Mean: {mean_score:.4f}, Std: {std_score:.4f}\n")
-    
-    svc_best_model = grid_search.best_estimator_
-    with open(f"weight/{model_version}_{args.embedding}_LogisticRegression.pkl", "wb") as file:
-        pkl.dump(svc_best_model, file)
-
-def train_RidgeClassifier(model_version, raw_data_path, label, args):
-    if args.embedding == "unimol_no_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=True)
-    elif args.embedding == "unimol_all_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=False)
-    elif args.embedding == "gin":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gin")
-    elif args.embedding == "gcn":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gcn")
-    else:
-        raise NotImplemented
-    
-    kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    
-    param_grid = {'alpha': np.logspace(-6, 6, 13)}
-
-    ridge = RidgeClassifier()
-    grid_search = GridSearchCV(estimator=ridge, param_grid=param_grid, scoring=scoring, refit="accuracy", cv=kfold)
-    grid_search.fit(X, y)
-
-    cv_results = grid_search.cv_results_
-
-    best_index = grid_search.best_index_
-    with open(f"log/{model_version}_{args.embedding}_RidgeClassifier.log", "a") as file:
-        file.write("Best Parameter Combination's Scores:\n")
-        for scorer in scoring.keys():
-            mean_metric_key = f'mean_test_{scorer}'
-            std_metric_key = f'std_test_{scorer}'
-            
-            mean_score = cv_results[mean_metric_key][best_index]
-            std_score = cv_results[std_metric_key][best_index]
-            
-            file.write(f"{scorer.capitalize()} - Mean: {mean_score:.4f}, Std: {std_score:.4f}\n")
-    
-    svc_best_model = grid_search.best_estimator_
-    with open(f"weight/{model_version}_{args.embedding}_RidgeClassifier.pkl", "wb") as file:
-        pkl.dump(svc_best_model, file)
-    
-def train_RandomForestClassifier(model_version, raw_data_path, label, args):
-    if args.embedding == "unimol_no_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=True)
-    elif args.embedding == "unimol_all_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=False)
-    elif args.embedding == "gin":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gin")
-    elif args.embedding == "gcn":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gcn")
-    else:
-        raise NotImplemented
-    
-    kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    
-    # param_grid = {
-    # 'n_estimators': [50, 100, 200],  # 树的数量
-    # 'max_features': ['auto', 'sqrt', 'log2'],  # 在分裂节点时考虑的特征数量
-    # 'max_depth': [None, 10, 20, 30],  # 树的最大深度
-    # 'min_samples_split': [2, 5, 10],  # 分裂内部节点所需的最小样本数
-    # 'min_samples_leaf': [1, 2, 4],  # 在叶节点处需要的最小样本数
-    # 'bootstrap': [True, False]  # 是否使用bootstrap采样
-    # }
-    
-    param_grid = {
-        'n_estimators': [50, 100],  # 树的数量
-        'max_features': ['sqrt', 'log2'],  # 在分裂节点时考虑的特征数量
-        'max_depth': [10, 20, 30],  # 树的最大深度
-    }
-
-    rf_classifier = RandomForestClassifier(random_state=42)
-    grid_search = GridSearchCV(estimator=rf_classifier, param_grid=param_grid, cv=kfold, scoring=scoring, refit="accuracy", n_jobs=-1)
-    grid_search.fit(X, y)
-
-    cv_results = grid_search.cv_results_
-
-    best_index = grid_search.best_index_
-    with open(f"log/{model_version}_{args.embedding}_RandomForestClassifier.log", "a") as file:
-        file.write("Best Parameter Combination's Scores:\n")
-        for scorer in scoring.keys():
-            mean_metric_key = f'mean_test_{scorer}'
-            std_metric_key = f'std_test_{scorer}'
-            
-            mean_score = cv_results[mean_metric_key][best_index]
-            std_score = cv_results[std_metric_key][best_index]
-            
-            file.write(f"{scorer.capitalize()} - Mean: {mean_score:.4f}, Std: {std_score:.4f}\n")
-    
-    svc_best_model = grid_search.best_estimator_
-
-    with open(f"weight/{model_version}_{args.embedding}_RandomForestClassifier.pkl", "wb") as file:
-        pkl.dump(svc_best_model, file)
-
-def train_GradientBoostingClassifier(model_version, raw_data_path, label, args):
-    if args.embedding == "unimol_no_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=True)
-    elif args.embedding == "unimol_all_h":
-        X, y = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=False)
-    elif args.embedding == "gin":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gin")
-    elif args.embedding == "gcn":
-        X, y = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gcn")
-    else:
-        raise NotImplemented
-    
-    kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-    # param_grid = {
-    #     'n_estimators': [100, 200, 300],  # 建立的弱学习器的数量
-    #     'learning_rate': [0.01, 0.1, 0.2],  # 学习率
-    #     'max_depth': [3, 4, 5],  # 每个决策树的最大深度
-    #     'min_samples_split': [2, 3, 4],  # 分裂内部节点所需的最小样本数
-    #     'min_samples_leaf': [1, 2, 3],  # 在叶节点处需要的最小样本数
-    #     'max_features': [None, 'sqrt', 'log2'],  # 寻找最佳分割时要考虑的特征数量
-    #     'subsample': [0.8, 0.9, 1.0]  # 用于拟合各个基础学习器的样本比例
-    # }
-    
-    param_grid = {
-        'n_estimators': [100, 200],
-        'learning_rate': [0.05, 0.1],
-        'max_depth': [3, 4],
-    }
-
-    gb_classifier = GradientBoostingClassifier(random_state=42)
-    grid_search = GridSearchCV(estimator=gb_classifier, param_grid=param_grid, cv=kfold, scoring=scoring, refit="accuracy", n_jobs=-1)
-    grid_search.fit(X, y)
-
-    cv_results = grid_search.cv_results_
-
-    best_index = grid_search.best_index_
-    with open(f"log/{model_version}_{args.embedding}_GradientBoostingClassifier.log", "a") as file:
-        file.write("Best Parameter Combination's Scores:\n")
-        for scorer in scoring.keys():
-            mean_metric_key = f'mean_test_{scorer}'
-            std_metric_key = f'std_test_{scorer}'
-            
-            mean_score = cv_results[mean_metric_key][best_index]
-            std_score = cv_results[std_metric_key][best_index]
-            
-            file.write(f"{scorer.capitalize()} - Mean: {mean_score:.4f}, Std: {std_score:.4f}\n")
-    
-    svc_best_model = grid_search.best_estimator_
-
-    with open(f"weight/{model_version}_{args.embedding}_GradientBoostingClassifier.pkl", "wb") as file:
-        pkl.dump(svc_best_model, file)
-    
-def save_UniMol_embedding(remove_hydrogen, raw_data_path, device):
-    data_loader = convert_whole_data_list_to_data_loader(remove_hydrogen, raw_data_path)
-    model = UniMolEncoder(device=device, remove_hydrogen=remove_hydrogen) # without shuffle
-    model.to(device)
-    if remove_hydrogen:
-        surfix = 'no_h'
-    else:
-        surfix = 'all_h'
-    
-    save_path = f'data/embedding/{os.path.basename(raw_data_path).split(".")[0]}_embedding_{surfix}.pkl'
-    embedding = {}
-    
-    for batch in tqdm(data_loader):
-        smiles_list, molecule_representation = model(batch)
-        assert len(smiles_list) == len(molecule_representation)
-        for i in range(len(smiles_list)):
-            embedding[smiles_list[i]] = molecule_representation[i]
-    
-    with open(save_path, "wb") as file:
-        pkl.dump(embedding, file)
-        
-def save_MolCLR_embedding(raw_data_path, label, task, model_choice, device):
-    dataset = MolTestDatasetWrapper(data_path=raw_data_path, target=label, task=task)
-    dataloader = dataset.get_fulldata_loader()
-    assert model_choice in ["gin", "gcn"]
-    if model_choice == "gin":
-        model = GINet()
-        try:
-            state_dict = torch.load("weight/gin.pth", map_location=device)
-            model.load_my_state_dict(state_dict)
-            model.to(device)
-            print("Loaded pre-trained model with success.")
-        except FileNotFoundError:
-            raise FileNotFoundError
-    elif model_choice == "gcn":
-        model = GCN()
-        try:
-            state_dict = torch.load("weight/gcn.pth", map_location=device)
-            model.load_my_state_dict(state_dict)
-            model.to(device)
-            print("Loaded pre-trained model with success.")       
-        except FileNotFoundError:
-            raise FileNotFoundError     
-    
-    if model_choice == "gin":
-        surfix = "gin"
-    elif model_choice == "gcn":
-        surfix = "gcn"
-    
-    save_path = f'data/embedding/{os.path.basename(raw_data_path).split(".")[0]}_embedding_{surfix}.pkl'
-    embedding = {}
-    
-    for batch in tqdm(dataloader):
-        batch.to(device)
-        smiles_list, molecule_representation = model(batch)
-        assert len(smiles_list) == len(molecule_representation)
-        for i in range(len(smiles_list)):
-            embedding[smiles_list[i]] = molecule_representation[i]
-    
-    with open(save_path, "wb") as file:
-        pkl.dump(embedding, file)
 
 def get_UniMol_embedding(remove_hydrogen, smiles_list:list, device):
     data_loader = convert_smiles_list_to_data_loader(remove_hydrogen, smiles_list=smiles_list)
@@ -985,36 +281,42 @@ def get_UniMol_embedding(remove_hydrogen, smiles_list:list, device):
 
 def get_MolCLR_embedding(smiles_list:list, model_choice, device):
     dataset = MolTestDatasetWrapper_smiles(smiles_list=smiles_list)
-    dataloader = dataset.get_fulldata_loader()
-    assert model_choice in ["gin", "gcn"]
-    if model_choice == "gin":
-        model = GINet()
-        try:
-            state_dict = torch.load("weight/gin.pth", map_location=device)
-            model.load_my_state_dict(state_dict)
-            model.to(device)
-            print("Loaded pre-trained model with success.")
-        except FileNotFoundError:
-            raise FileNotFoundError
-    elif model_choice == "gcn":
-        model = GCN()
-        try:
-            state_dict = torch.load("weight/gcn.pth", map_location=device)
-            model.load_my_state_dict(state_dict)
-            model.to(device)
-            print("Loaded pre-trained model with success.")       
-        except FileNotFoundError:
-            raise FileNotFoundError     
-    
-    representations = []
-    smiles = []
-    for batch in tqdm(dataloader):
-        batch.to(device)
-        batch_smiles, batch_representations = model(batch)
-        representations.append(batch_representations)
-        smiles.extend(batch_smiles)
+    dataloader, embeddable = dataset.get_fulldata_loader()
+    if not all(not value for value in embeddable.values()):
+        assert model_choice in ["gin", "gcn"]
+        if model_choice == "gin":
+            model = GINet()
+            try:
+                state_dict = torch.load("weight/gin.pth", map_location=device)
+                model.load_my_state_dict(state_dict)
+                model.to(device)
+                print("Loaded pre-trained model with success.")
+            except FileNotFoundError:
+                raise FileNotFoundError
+        elif model_choice == "gcn":
+            model = GCN()
+            try:
+                state_dict = torch.load("weight/gcn.pth", map_location=device)
+                model.load_my_state_dict(state_dict)
+                model.to(device)
+                print("Loaded pre-trained model with success.")       
+            except FileNotFoundError:
+                raise FileNotFoundError     
         
-    return smiles, torch.cat(representations, dim=0)
+        representations = []
+        smiles = []
+        for batch in tqdm(dataloader):
+            batch.to(device)
+            batch_smiles, batch_representations = model(batch)
+            representations.append(batch_representations)
+            smiles.extend(batch_smiles)
+        
+        return embeddable, smiles, torch.cat(representations, dim=0)
+
+    else:
+        return embeddable, None, None
+
+
 
 def user_single_smiles_predict(smiles:str, device, embedding: dict, trained_model: dict):
     """
@@ -1025,14 +327,17 @@ def user_single_smiles_predict(smiles:str, device, embedding: dict, trained_mode
     assert (i in embedding for i in ["Formal charge", "Q_vsa_Ppos", "vsa_don", "PA Accum"])
     assert (i in trained_model for i in ["Formal charge", "Q_vsa_Ppos", "vsa_don", "PA Accum"])
     X = {}
-    unembeddable_smiles = {}
-    embeddable_smiles = {}
+    embeddable = True
     
     for label, embed_type in embedding.items():
         if embed_type == "gin":
-            _, X[label] = get_MolCLR_embedding(smiles_list=[smiles], model_choice="gin", device=device)
+            embeddable, _, X[label] = get_MolCLR_embedding(smiles_list=[smiles], model_choice="gin", device=device)
+            if embeddable[smiles] == False:
+                return None, None, None, None, None, None
         elif embed_type == "gcn":
-            _, X[label] = get_MolCLR_embedding(smiles_list=[smiles], model_choice="gcn", device=device)
+            embeddable, _, X[label] = get_MolCLR_embedding(smiles_list=[smiles], model_choice="gcn", device=device)
+            if embeddable[smiles] == False:
+                return None, None, None, None, None, None
         elif embed_type == "unimol_no_h":
             _, X[label] = get_UniMol_embedding(remove_hydrogen=True, smiles_list=[smiles], device=device)
         elif embed_type == "unimol_all_h":
@@ -1079,9 +384,9 @@ def user_smiles_list_predict(smiles_list_path:str, device, embedding: dict, trai
     
     for label, embed_type in embedding.items():
         if embed_type == "gin":
-            _, X[label] = get_MolCLR_embedding(smiles_list=smiles_list, model_choice="gin", device=device)
+            embeddable, _, X[label] = get_MolCLR_embedding(smiles_list=smiles_list, model_choice="gin", device=device)
         elif embed_type == "gcn":
-            _, X[label] = get_MolCLR_embedding(smiles_list=smiles_list, model_choice="gcn", device=device)
+            embeddable, _, X[label] = get_MolCLR_embedding(smiles_list=smiles_list, model_choice="gcn", device=device)
         elif embed_type == "unimol_no_h":
             _, X[label] = get_UniMol_embedding(remove_hydrogen=True, smiles_list=smiles_list, device=device)
         elif embed_type == "unimol_all_h":
@@ -1106,92 +411,7 @@ def user_smiles_list_predict(smiles_list_path:str, device, embedding: dict, trai
     
     return smiles_list, Formal_charge_prediction, Q_vsa_Ppos_prediction, vsa_don_prediction, rule_PA_Accum_prediction, direct_PA_Accum_prediction
     
-def rule_based_Accum_eval(raw_data_path:str, rule_based_embedding:list, rule_based_model:list):
-    """
-    e.g., rule_based_embedding = {"Formal charge Class":"gcn", "Q_vsa_Ppos Class":"gin", "vsa_don Class":"gin"}
-    rule_based_model = {"Formal charge Class":"mlp", "Q_vsa_Ppos Class":"mlp", "vsa_don Class":"mlp"}
-    """
-    X = {}
-    y = {}
-    model = {}
-    smiles_list = {}
-    
-    for label in ["Formal charge Class", "Q_vsa_Ppos Class", "vsa_don Class", "PA Accum Class"]:
-        if rule_based_embedding[label] == "unimol_no_h":
-            smiles_list[label], X[label], y[label] = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=True)
-        elif rule_based_embedding[label] == "unimol_all_h":
-            smiles_list[label], X[label], y[label] = get_UniMol_data_loader(raw_data_path=raw_data_path, label=label, remove_hydrogen=False)
-        elif rule_based_embedding[label] == "gin":
-            smiles_list[label], X[label], y[label] = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gin")
-        elif rule_based_embedding[label] == "gcn":
-            smiles_list[label], X[label], y[label] = get_MolCLR_data_loader(raw_data_path=raw_data_path, label=label, model="gcn")
-    
-    assert len(X["Formal charge Class"]) == len(X["Q_vsa_Ppos Class"]) == len(X["vsa_don Class"])
-    assert smiles_list["Formal charge Class"] == smiles_list["Q_vsa_Ppos Class"] == smiles_list["vsa_don Class"] == smiles_list["PA Accum Class"]
-    
-    for label in ["Formal charge Class", "Q_vsa_Ppos Class", "vsa_don Class"]:
-        assert rule_based_model[label] == "mlp"
-        with open(f"weight/{label}_{rule_based_embedding[label]}_{rule_based_model[label]}.pkl","rb") as file:
-            trained_pipeline = pkl.load(file)
-        hyperparameters = trained_pipeline.get_params()
-        model[label] =  Pipeline([
-            ('standardscaler', StandardScaler()),
-            ('mlpclassifier', MLPClassifier(max_iter=10000, verbose=10, random_state=12))
-        ]).set_params(**hyperparameters)
-        
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    accumulation_metrics = {
-        'accuracy': [],
-        'precision': [],
-        'recall': [],
-        'f1': [],
-        'tp': [],
-        'fp': [],
-        'tn': [],
-        'fn': []
-    }
 
-    for train_index, test_index in kf.split(X["Formal charge Class"]):
-
-        # Train MLP classifiers using the extracted features and saved hyperparameters
-        mlp_fc = model["Formal charge Class"]
-        mlp_fc.fit(X["Formal charge Class"][train_index], y["Formal charge Class"][train_index])
-        predictions_fc = mlp_fc.predict(X["Formal charge Class"][test_index])
-        
-        mlp_qvsa = model["Q_vsa_Ppos Class"]
-        mlp_qvsa.fit(X["Q_vsa_Ppos Class"][train_index], y["Q_vsa_Ppos Class"][train_index])
-        predictions_qvsa = mlp_qvsa.predict(X["Q_vsa_Ppos Class"][test_index])
-        
-        mlp_vsa = model["vsa_don Class"]
-        mlp_vsa.fit(X["vsa_don Class"][train_index], y["vsa_don Class"][train_index])
-        predictions_vsa = mlp_vsa.predict(X["vsa_don Class"][test_index])
-        
-        # Combine individual predictions using rule-based logic
-        accumulation_predictions = predictions_vsa & (predictions_fc | predictions_qvsa)
-
-        # Evaluate metrics
-        accuracy = accuracy_score(y["PA Accum Class"][test_index], accumulation_predictions)
-        precision = precision_score(y["PA Accum Class"][test_index], accumulation_predictions)
-        recall = recall_score(y["PA Accum Class"][test_index], accumulation_predictions)
-        f1 = f1_score(y["PA Accum Class"][test_index], accumulation_predictions)
-        tn, fp, fn,tp = confusion_matrix(y["PA Accum Class"][test_index], accumulation_predictions).ravel()
-
-        # Store metrics for this fold
-        accumulation_metrics['accuracy'].append(accuracy)
-        accumulation_metrics['precision'].append(precision)
-        accumulation_metrics['recall'].append(recall)
-        accumulation_metrics['f1'].append(f1)
-        accumulation_metrics['tp'].append(tp)
-        accumulation_metrics['fp'].append(fp)
-        accumulation_metrics['tn'].append(tn)
-        accumulation_metrics['fn'].append(fn)
-
-    average_metrics = {metric: f"mean: {round(statistics.mean(values),4)}; std: {round(statistics.stdev(values),4)}" for metric, values in accumulation_metrics.items()}
-
-    for metric, stat in average_metrics.items():
-        print(f"{metric}          {stat}")
-        
-    return average_metrics
     
 
 if __name__ == "__main__":
@@ -1317,18 +537,19 @@ def get_predicted_properties(smiles):
     parser.add_argument("--user_single_smiles_prediction", default=True, type=bool)
     # parser.add_argument("--user_smiles_list_prediction", default=False, type=bool)
     # parser.add_argument("--user_smiles_list", default="user_data/user_smiles_list.csv", type=str)
+    parser.add_argument("--gpu", default="cuda:4", type=str)
     parser.add_argument("--user_single_smiles", type=str)
-    parser.add_argument("--Formal_charge_embedding", default="gin", type=str, choices=["unimol_no_h", "unimol_all_h", "gin", "gcn", "mordred"])
-    parser.add_argument("--Q_vsa_Ppos_embedding", default="gcn", type=str, choices=["unimol_no_h", "unimol_all_h", "gin", "gcn", "mordred"])
-    parser.add_argument("--vsa_don_embedding", default="unimol_no_h", type=str, choices=["unimol_no_h", "unimol_all_h", "gin", "gcn", "mordred"])
-    parser.add_argument("--PA_Accum_embedding", default="unimol_all_h", type=str, choices=["unimol_no_h", "unimol_all_h", "gin", "gcn", "mordred"])
-    parser.add_argument("--Formal_charge_model", default="knn", type=str, choices=["svc", "mlp", "knn", "LogisticRegression", "RidgeClassifier", 
+    parser.add_argument("--Formal_charge_embedding", default="gcn", type=str, choices=["unimol_no_h", "unimol_all_h", "gin", "gcn", "mordred"])
+    parser.add_argument("--Q_vsa_Ppos_embedding", default="gin", type=str, choices=["unimol_no_h", "unimol_all_h", "gin", "gcn", "mordred"])
+    parser.add_argument("--vsa_don_embedding", default="gin", type=str, choices=["unimol_no_h", "unimol_all_h", "gin", "gcn", "mordred"])
+    parser.add_argument("--PA_Accum_embedding", default="gcn", type=str, choices=["unimol_no_h", "unimol_all_h", "gin", "gcn", "mordred"])
+    parser.add_argument("--Formal_charge_model", default="mlp", type=str, choices=["svc", "mlp", "knn", "LogisticRegression", "RidgeClassifier", 
                                  "RandomForestClassifier", "GradientBoostingClassifier"])
-    parser.add_argument("--Q_vsa_Ppos_model", default="knn", type=str, choices=["svc", "mlp", "knn", "LogisticRegression", "RidgeClassifier", 
+    parser.add_argument("--Q_vsa_Ppos_model", default="mlp", type=str, choices=["svc", "mlp", "knn", "LogisticRegression", "RidgeClassifier", 
                                  "RandomForestClassifier", "GradientBoostingClassifier"])
-    parser.add_argument("--vsa_don_model", default="knn", type=str, choices=["svc", "mlp", "knn", "LogisticRegression", "RidgeClassifier", 
+    parser.add_argument("--vsa_don_model", default="mlp", type=str, choices=["svc", "mlp", "knn", "LogisticRegression", "RidgeClassifier", 
                                  "RandomForestClassifier", "GradientBoostingClassifier"])
-    parser.add_argument("--PA_Accum_model", default="knn", type=str, choices=["svc", "mlp", "knn", "LogisticRegression", "RidgeClassifier", 
+    parser.add_argument("--PA_Accum_model", default="mlp", type=str, choices=["svc", "mlp", "knn", "LogisticRegression", "RidgeClassifier", 
                                  "RandomForestClassifier", "GradientBoostingClassifier"])
     
     args = parser.parse_args()
@@ -1348,34 +569,43 @@ def get_predicted_properties(smiles):
     (Formal_charge_prediction, Q_vsa_Ppos_prediction, vsa_don_prediction, 
      rule_PA_Accum_prediction, direct_PA_Accum_prediction) = user_single_smiles_predict(smiles=args.user_single_smiles, device=args.device, 
                                                                           embedding=embedding, trained_model=trained_model)
-    print(f"prediction of {args.user_smiles}:")
-    if Formal_charge_prediction:
-        Foraml_charge_prompt = ">= 0.98"
-    else:
-        Foraml_charge_prompt = "< 0.98"
-    if Q_vsa_Ppos_prediction:
-        Q_vsa_Ppos_prompt = ">= 80"
-    else:
-        Q_vsa_Ppos_prompt = "< 80"
-    if vsa_don_prediction:
-        vsa_don_prompt = ">= 23"
-    else:
-        vsa_don_prompt = "< 23"
-    if rule_PA_Accum_prediction:
-        print("rule-base prediction of PA Accumulation [(vsa_don >= 23) && ((Q_vsa_Ppos >= 80) || (Formal Charge >= 0.98))]: Yes")
-    else:
-        print("rule-base prediction of PA Accumulation [(vsa_don >= 23) && ((Q_vsa_Ppos >= 80) || (Formal Charge >= 0.98))]: No")
-    if direct_PA_Accum_prediction:
-        direct_PA_Accum_prompt = "Accumalation: Yes"
-    else:
-        direct_PA_Accum_prompt = "Accumalation: No"
     
-    return {
-            "Formal Charge": Formal_charge_prediction,
-            "Q_vsa_Ppos": Q_vsa_Ppos_prediction,
-            "vsa_don": vsa_don_prediction,
-            "PA Accumulation": direct_PA_Accum_prediction
-           }
+    if Formal_charge_prediction is None:
+        return {
+            "Formal Charge": None,
+            "Q_vsa_Ppos": None,
+            "vsa_don": None,
+            "PA Accumulation": None
+        }
+    
+    else: 
+        if Formal_charge_prediction:
+            Foraml_charge_prompt = ">= 0.98"
+        else:
+            Foraml_charge_prompt = "< 0.98"
+        if Q_vsa_Ppos_prediction:
+            Q_vsa_Ppos_prompt = ">= 80"
+        else:
+            Q_vsa_Ppos_prompt = "< 80"
+        if vsa_don_prediction:
+            vsa_don_prompt = ">= 23"
+        else:
+            vsa_don_prompt = "< 23"
+        if rule_PA_Accum_prediction:
+            print("rule-base prediction of PA Accumulation [(vsa_don >= 23) && ((Q_vsa_Ppos >= 80) || (Formal Charge >= 0.98))]: Yes")
+        else:
+            print("rule-base prediction of PA Accumulation [(vsa_don >= 23) && ((Q_vsa_Ppos >= 80) || (Formal Charge >= 0.98))]: No")
+        if direct_PA_Accum_prediction:
+            direct_PA_Accum_prompt = "Accumalation: Yes"
+        else:
+            direct_PA_Accum_prompt = "Accumalation: No"
+        
+        return {
+                "Formal Charge": Formal_charge_prediction,
+                "Q_vsa_Ppos": Q_vsa_Ppos_prediction,
+                "vsa_don": vsa_don_prediction,
+                "PA Accumulation": direct_PA_Accum_prediction
+            }
     
     
     

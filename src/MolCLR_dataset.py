@@ -296,16 +296,20 @@ class MolTestDatasetWrapper_smiles(object):
             feature_cols: list of column names for additional graph features
         """
         super(object, self).__init__()
+        embeddable = {}
         smiles_filtered = []
         for smiles in smiles_list:
             try:
                 mol = Chem.MolFromSmiles(smiles)
                 mol = Chem.AddHs(mol)
                 smiles_filtered.append(smiles)
+                embeddable[smiles] = True
             except:
+                embeddable[smiles] = False
                 continue
                 
         self.smiles_list = smiles_filtered
+        self.embeddable = embeddable
         self.batch_size = batch_size
         self.num_workers=1
 
@@ -330,5 +334,5 @@ class MolTestDatasetWrapper_smiles(object):
             num_workers=self.num_workers,
             drop_last=False,
         )
-        return loader
+        return loader, self.embeddable
 
